@@ -1,0 +1,17 @@
+
+# Generated binaries
+build/
+
+# Local dependencies
+deps/
+
+# Kernel-specific generated header
+src/vmlinux.h
+
+# Editor files
+.vscode/
+.idea/
+
+# Miscellaneous
+*.swp
+*~
