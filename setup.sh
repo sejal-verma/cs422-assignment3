@@ -31,21 +31,18 @@ fail() {
 cleanup() {
     trap - EXIT INT TERM
 
-    if [[ "$CHANGED_ALLOWED" -eq 1 ]]; then
-        log "Restoring allowed congestion-control algorithms..."
-        # Restore only if our cs422 entry is still present.
-        CURRENT=$(sysctl -n net.ipv4.tcp_allowed_congestion_control 2>/dev/null || true)
-        if [[ " $CURRENT " == *" cs422 "* ]]; then
-            sudo sysctl -q -w \
-                "net.ipv4.tcp_allowed_congestion_control=$ORIGINAL_ALLOWED" \
-                2>/dev/null || true
-        fi
-    fi
-
     if [[ -n "$LOADER_PID" ]]; then
         log "Unloading cs422..."
         sudo kill -INT "$LOADER_PID" 2>/dev/null || true
         wait "$LOADER_PID" 2>/dev/null || true
+    fi
+
+    if [[ "$CHANGED_ALLOWED" -eq 1 ]]; then
+        log "Restoring allowed congestion-control algorithms..."
+
+        sudo sysctl -q -w \
+            "net.ipv4.tcp_allowed_congestion_control=$ORIGINAL_ALLOWED" \
+            2>/dev/null || true
     fi
 }
 
@@ -91,26 +88,20 @@ mkdir -p "$BUILD_DIR" "$DEPS_DIR" "$LIBBPF_INSTALL"
 # 2. Install dependencies
 # --------------------------------------------------
 
-log "Installing dependencies..."
+if [[ ! -f "$DEPS_DIR/.packages-installed" ]]; then
+    log "Installing dependencies..."
 
-sudo apt-get update
+    sudo apt-get update
 
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    build-essential \
-    clang \
-    llvm \
-    libelf-dev \
-    zlib1g-dev \
-    libssl-dev \
-    libzstd-dev \
-    flex \
-    bison \
-    pkg-config \
-    git \
-    make \
-    iperf3 \
-    iproute2 \
-    libcap-dev
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        build-essential clang llvm libelf-dev zlib1g-dev \
+        libssl-dev libzstd-dev flex bison pkg-config \
+        git make iperf3 iproute2 libcap-dev
+
+    touch "$DEPS_DIR/.packages-installed"
+else
+    log "Dependencies already installed. Skipping."
+fi
 
 # --------------------------------------------------
 # 3. Build libbpf
@@ -118,24 +109,34 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
 
 log "Preparing libbpf..."
 
-if [[ ! -d "$LIBBPF_SRC/.git" ]]; then
-    git clone --depth 1 \
-        https://github.com/libbpf/libbpf.git \
-        "$LIBBPF_SRC"
-fi
-
-make -C "$LIBBPF_SRC/src" \
-    BUILD_STATIC_ONLY=1 \
-    OBJDIR="$DEPS_DIR/libbpf-obj" \
-    DESTDIR="$LIBBPF_INSTALL" \
-    PREFIX=/ \
-    install
-
 LIBBPF_INCLUDE="$LIBBPF_INSTALL/include"
 LIBBPF_ARCHIVE="$LIBBPF_INSTALL/lib64/libbpf.a"
 
 if [[ ! -f "$LIBBPF_ARCHIVE" ]]; then
     LIBBPF_ARCHIVE="$LIBBPF_INSTALL/lib/libbpf.a"
+fi
+
+if [[ ! -f "$LIBBPF_SRC/src/Makefile" ]]; then
+    rm -rf "$LIBBPF_SRC"
+
+    git clone --depth 1 \
+        https://github.com/libbpf/libbpf.git \
+        "$LIBBPF_SRC"
+fi
+
+if [[ ! -f "$LIBBPF_ARCHIVE" ]]; then
+    make -C "$LIBBPF_SRC/src" \
+        BUILD_STATIC_ONLY=1 \
+        OBJDIR="$DEPS_DIR/libbpf-obj" \
+        DESTDIR="$LIBBPF_INSTALL" \
+        PREFIX=/ \
+        install
+
+    LIBBPF_ARCHIVE="$LIBBPF_INSTALL/lib64/libbpf.a"
+
+    if [[ ! -f "$LIBBPF_ARCHIVE" ]]; then
+        LIBBPF_ARCHIVE="$LIBBPF_INSTALL/lib/libbpf.a"
+    fi
 fi
 
 [[ -f "$LIBBPF_ARCHIVE" ]] ||
@@ -147,35 +148,41 @@ fi
 
 log "Preparing bpftool..."
 
-if [[ ! -d "$BPFTOOL_SRC/.git" ]]; then
-    git clone --depth 1 --recurse-submodules \
-        --shallow-submodules \
-        https://github.com/libbpf/bpftool.git \
-        "$BPFTOOL_SRC"
-else
-    git -C "$BPFTOOL_SRC" submodule update \
-        --init --recursive
-fi
-
 if [[ ! -x "$BPFTOOL_BIN" ]]; then
+
+    if [[ ! -f "$BPFTOOL_SRC/src/Makefile" ]]; then
+        rm -rf "$BPFTOOL_SRC"
+
+        git clone --depth 1 --recurse-submodules \
+            --shallow-submodules \
+            https://github.com/libbpf/bpftool.git \
+            "$BPFTOOL_SRC"
+    else
+        git -C "$BPFTOOL_SRC" submodule update \
+            --init --recursive
+    fi
+
     make -C "$BPFTOOL_SRC/src" -j"$(nproc)"
 fi
 
 [[ -x "$BPFTOOL_BIN" ]] ||
     fail "bpftool build failed."
 
-"$BPFTOOL_BIN" version >/dev/null ||
-    fail "bpftool could not execute."
-
 # --------------------------------------------------
 # 5. Generate kernel headers
 # --------------------------------------------------
 
-log "Generating vmlinux.h..."
+if [[ ! -f "$SRC_DIR/vmlinux.h" ||
+      /sys/kernel/btf/vmlinux -nt "$SRC_DIR/vmlinux.h" ]]; then
 
-"$BPFTOOL_BIN" btf dump \
-    file /sys/kernel/btf/vmlinux \
-    format c > "$SRC_DIR/vmlinux.h"
+    log "Generating vmlinux.h..."
+
+    "$BPFTOOL_BIN" btf dump \
+        file /sys/kernel/btf/vmlinux \
+        format c > "$SRC_DIR/vmlinux.h"
+else
+    log "Using existing vmlinux.h."
+fi
 
 # --------------------------------------------------
 # 6. Compile eBPF program
@@ -267,10 +274,10 @@ printf ' CS422 READY\n\r'
 printf '========================================\n\r'
 printf '\n\r'
 
-printf '\rAvailable algorithms:\n'
+printf '\rAvailable algorithms:\n\r'
 sysctl -n net.ipv4.tcp_available_congestion_control
 
-printf '\r\n\rAllowed algorithms:\n'
+printf '\r\n\rAllowed algorithms:\n\r'
 sysctl -n net.ipv4.tcp_allowed_congestion_control
 printf '\r\n'
 
