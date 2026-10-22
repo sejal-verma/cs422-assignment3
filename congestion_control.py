@@ -1,7 +1,7 @@
 import socket
 
 
-SUPPORTED_ALGORITHMS = ("cubic", "reno", "bbr")
+SUPPORTED_ALGORITHMS = ("cubic", "reno", "bbr", "cs422")
 
 
 def set_congestion_algorithm(sock: socket.socket, algorithm: str) -> None:

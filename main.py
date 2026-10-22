@@ -1,17 +1,24 @@
-"""CS 422 Assignment 2 -- Parts 1 & 2(a): iperf3 client + TCP statistics trace.
+"""
+CS 422 - TCP Congestion Control Experiments
 
-Run:   python3 main_simplified.py --n 10 --duration 10
-Needs: Linux (for TCP_INFO), matplotlib, numpy.
+Implements an iperf3-compatible TCP client for measuring congestion-control
+behavior across different network destinations.
 
-Outputs: destination_log.txt, tcp_stats_trace.csv, summary_table.csv, goodput_plot.png, representative_tcp_time_series.pdf, representative_tcp_scatter.pdf
+Supports:
+    - TCP statistics collection using Linux TCP_INFO
+    - Per-interval goodput, RTT, cwnd, and retransmission measurements
+    - Testing CUBIC, Reno, BBR, and custom CS422 congestion control
+    - Repeated experiments with rotated algorithm order
+    - Per-run and aggregate statistics
+    - Comparative time-series and scatter plots
 
+Usage:
+    python3 main.py --host HOST --port PORT --algorithm cubic
+    python3 main.py --compare --host HOST --port PORT --duration 10 --repetitions 5
 
-How the numbers are computed (copy into the report):
-  decoding   : getsockopt(IPPROTO_TCP, TCP_INFO) on the DATA socket, decoded with a
-               ctypes mirror of Linux `struct tcp_info` (fields in kernel order).
-  goodput    : (bytes_acked_now - bytes_acked_prev) * 8 / (t_now - t_prev)   [bits/s]
-  loss proxy : new_retrans = total_retrans_now - total_retrans_prev  [segments/interval]
-               (lost = tcpi_lost, the kernel's current count of segments presumed lost)
+Outputs:
+    Per-run TCP statistics, summary CSVs, aggregate comparison CSV,
+    destination logs, and PDF plots.
 """
 
 import argparse
@@ -127,7 +134,7 @@ def get_congestion_algorithm(sock: socket.socket) -> str:
 def set_congestion_algorithm(sock: socket.socket, algorithm: str) -> None:
     """Set the TCP congestion-control algorithm for this socket."""
 
-    if algorithm not in ("cubic", "reno", "bbr"):
+    if algorithm not in ("cubic", "reno", "bbr", "cs422"):
         raise ValueError(f"Unsupported congestion-control algorithm: {algorithm}")
 
     opt = getattr(socket, "TCP_CONGESTION", 13)
@@ -299,7 +306,7 @@ class Iperf3Client:
         start = time.monotonic()
         deadline = start + self.duration
         last_sample = start
-        self.data_sock.settimeout(SAMPLE_INTERVAL / 4)   # send() never blocks long
+        self.data_sock.settimeout(SAMPLE_INTERVAL / 4)   # Limit blocking time so sampling can continue
 
         if self.on_sample:
             self.on_sample(self.data_sock, 0.0, 0)       # baseline at t=0
@@ -501,6 +508,54 @@ def run_fixed_destination(host: str, port: int, duration: float,
     return results, log_lines
 
 
+def run_comparison(host: str, port: int, duration: float, repetitions: int):
+    """
+    Compare CS422, CUBIC, Reno, and BBR under identical test settings.
+
+    Each repetition tests all four algorithms against the same destination
+    using the same duration and TCP_INFO sampling interval.
+
+    Algorithm order rotates between repetitions to reduce systematic bias
+    from time-varying network conditions. A short delay separates tests
+    to allow the iperf3 server to finish processing the previous session.
+    """
+    algorithms = ("cs422", "cubic", "reno", "bbr")
+
+    all_results = []
+    all_logs = []
+
+    for repetition in range(1, repetitions + 1):
+        # Rotate test order to reduce time-order bias.
+        shift = (repetition - 1) % len(algorithms)
+        order = algorithms[shift:] + algorithms[:shift]
+
+        for algorithm in order:
+            print(f"\nRepetition {repetition}/{repetitions}: {algorithm}")
+
+            results, logs = run_fixed_destination(
+                host=host,
+                port=port,
+                duration=duration,
+                algorithm=algorithm,
+                repetitions=1
+            )
+
+            for result in results:
+                result.run_id = f"{algorithm}_run_{repetition}"
+
+            # Correct the repetition number in the text logs.
+            for log in logs:
+                all_logs.append(
+                    log.replace("run=1", f"run={repetition}")
+                )
+
+            all_results.extend(results)
+            # Allow the iperf3 server to finish the previous test.
+            time.sleep(2)
+
+    return all_results, all_logs
+
+
 # ==============================================================================
 # Outputs: trace CSV, summary table, plot
 # ==============================================================================
@@ -517,22 +572,93 @@ def write_trace_csv(results: list[TestResult], path: Path) -> None:
 
 
 def build_summary_table(results: list[TestResult]) -> list[dict]:
-    """Min / median / mean / p95 goodput (Mbps) per destination.
-    All samples count, even zero-goodput ones: stalls are real behavior."""
+    """Calculate goodput and RTT statistics for every test run."""
     rows = []
+
     for r in results:
+        if not r.samples:
+            continue
+
         mbps = np.array([s.goodput_bps for s in r.samples]) / 1e6
+        rtt_ms = np.array([s.rtt_us for s in r.samples]) / 1000.0
+
         rows.append({
             "destination": f"{r.host}:{r.port}",
             "run_id": r.run_id,
             "algorithm": r.algorithm,
-            "min_Mbps": mbps.min(),
-            "median_Mbps": np.median(mbps),
-            "mean_Mbps": mbps.mean(),
-            "p95_Mbps": np.percentile(mbps, 95),
+
+            "min_Mbps": float(np.min(mbps)),
+            "median_Mbps": float(np.median(mbps)),
+            "mean_Mbps": float(np.mean(mbps)),
+            "p95_Mbps": float(np.percentile(mbps, 95)),
+
+            "min_RTT_ms": float(np.min(rtt_ms)),
+            "median_RTT_ms": float(np.median(rtt_ms)),
+            "mean_RTT_ms": float(np.mean(rtt_ms)),
+            "p95_RTT_ms": float(np.percentile(rtt_ms, 95)),
+
+            "total_retransmissions": int(
+                r.samples[-1].total_retrans
+            ),
         })
+
     return rows
 
+
+def build_aggregate_summary(results: list[TestResult]) -> list[dict]:
+    """
+    Aggregate performance statistics across successful repetitions.
+
+    First calculate the mean goodput and RTT for each individual run.
+    Then compute aggregate statistics across those run-level means,
+    giving every successful repetition equal weight.
+
+    Retransmissions are summarized as the average number of
+    retransmitted segments per successful run.
+    """
+    rows = []
+
+    for algorithm in ("cs422", "cubic", "reno", "bbr"):
+        runs = [
+            r for r in results
+            if r.algorithm == algorithm and r.samples
+        ]
+
+        if not runs:
+            continue
+
+        # Calculate a mean for each run first.
+        # This gives each repetition equal weight.
+        run_goodput = np.array([
+            np.mean([s.goodput_bps for s in r.samples]) / 1e6
+            for r in runs
+        ])
+
+        run_rtt = np.array([
+            np.mean([s.rtt_us for s in r.samples]) / 1000
+            for r in runs
+        ])
+
+        run_retrans = np.array([
+            sum(s.new_retrans for s in r.samples)
+            for r in runs
+        ])
+
+        rows.append({
+            "algorithm": algorithm,
+            "successful_runs": len(runs),
+            "mean_goodput_Mbps": float(np.mean(run_goodput)),
+            "median_goodput_Mbps": float(np.median(run_goodput)),
+            "min_goodput_Mbps": float(np.min(run_goodput)),
+            "p95_goodput_Mbps": float(np.percentile(run_goodput, 95)),
+            "mean_RTT_ms": float(np.mean(run_rtt)),
+            "median_RTT_ms": float(np.median(run_rtt)),
+            "min_RTT_ms": float(np.min(run_rtt)),
+            "p95_RTT_ms": float(np.percentile(run_rtt, 95)),
+            "mean_retransmissions_per_run": float(np.mean(run_retrans)),
+        })
+
+    return rows
 
 def write_summary_csv(rows: list[dict], path: Path) -> None:
     with open(path, "w", newline="") as f:
@@ -583,6 +709,11 @@ def generate_representative_plots(results: list[TestResult], out_dir: Path) -> N
     cwnd = [sample.snd_cwnd for sample in samples]
     rtt_ms = [sample.rtt_us / 1e3 for sample in samples]
     loss_signal = [sample.new_retrans for sample in samples]
+    # Same axis scales for all comparisons
+    CWND_MAX = 12000
+    RTT_MAX = 800
+    LOSS_MAX = 1000
+    GOODPUT_MAX = 120
 
     fig, axes = plt.subplots(4, 1, figsize=(9, 11), sharex=True)
     time_series = [
@@ -595,10 +726,14 @@ def generate_representative_plots(results: list[TestResult], out_dir: Path) -> N
         ax.plot(elapsed, values, marker="o", markersize=2, linewidth=1)
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
+        axes[0].set_ylim(0, CWND_MAX)
+        axes[1].set_ylim(0, RTT_MAX)
+        axes[2].set_ylim(0, LOSS_MAX)
+        axes[3].set_ylim(0, GOODPUT_MAX)
     axes[-1].set_xlabel("Time (s)")
     fig.suptitle(title)
     fig.tight_layout()
-    time_series_path = out_dir / "representative_tcp_time_series.pdf"
+    time_series_path = out_dir / f"{representative.algorithm}_representative_tcp_time_series.pdf"    
     fig.savefig(time_series_path)
     plt.close(fig)
 
@@ -615,39 +750,158 @@ def generate_representative_plots(results: list[TestResult], out_dir: Path) -> N
         ax.set_ylabel("Goodput (Mbps)")
         ax.set_title(plot_title)
         ax.grid(True, alpha=0.3)
+    # Same x-axis scales for each metric
+    axes[0].set_xlim(0, CWND_MAX)
+    axes[1].set_xlim(0, RTT_MAX)
+    axes[2].set_xlim(0, LOSS_MAX)
+    # Same goodput scale on all scatter plots
+    for ax in axes:
+        ax.set_ylim(0, GOODPUT_MAX)
     fig.suptitle(title)
     fig.tight_layout()
-    scatter_path = out_dir / "representative_tcp_scatter.pdf"
+    scatter_path = out_dir / f"{representative.algorithm}_representative_tcp_scatter.pdf"
     fig.savefig(scatter_path)
     plt.close(fig)
 
     print(f"Saved representative plots: {time_series_path}, {scatter_path}")
 
+
+def generate_comparison_plots(results: list[TestResult], out_dir: Path) -> None:
+    """
+    Generate comparative TCP time-series and scatter plots.
+
+    For each algorithm, use its first successful run as a representative
+    example. The plots visualize instantaneous behavior rather than
+    aggregate performance across all repetitions.
+
+    Full per-sample data for every successful run is retained in the
+    TCP statistics CSV.
+    """
+    algorithms = ("cs422", "cubic", "reno", "bbr")
+
+    # Choose the first successful run for each algorithm.
+    representative = {}
+    for algorithm in algorithms:
+        matching = [
+            r for r in results
+            if r.algorithm == algorithm and r.samples
+        ]
+        if matching:
+            representative[algorithm] = matching[0]
+
+    if not representative:
+        print("No successful runs available for comparison plots.")
+        return
+
+    missing = set(algorithms) - set(representative)
+    if missing:
+        print(f"Warning: missing comparison data for {sorted(missing)}")
+
+    destination = (
+        f"{next(iter(representative.values())).host}:"
+        f"{next(iter(representative.values())).port}"
+    )
+
+    metrics = [
+        ("snd_cwnd", "Congestion window (segments)", 1),
+        ("rtt_us", "RTT (ms)", 1000),
+        ("new_retrans", "Retransmissions (segments/interval)", 1),
+        ("goodput_bps", "Goodput (Mbps)", 1e6),
+    ]
+
+    # Time-series plots: four panels, one per metric.
+    fig, axes = plt.subplots(4, 1, figsize=(11, 13), sharex=True)
+
+    for ax, (field, ylabel, divisor) in zip(axes, metrics):
+        for algorithm, result in representative.items():
+            times = [s.elapsed_s for s in result.samples]
+            values = [getattr(s, field) / divisor for s in result.samples]
+
+            ax.plot(times, values, label=algorithm.upper(),
+                    linewidth=1.5)
+
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    axes[-1].set_xlabel("Time (seconds)")
+    fig.suptitle(f"TCP Congestion Control Comparison - {destination}")
+    fig.tight_layout()
+
+    path = out_dir / "comparison_time_series.pdf"
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"Saved: {path}")
+
+    # Scatter plots: each algorithm on the same axes.
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+    scatter_metrics = [
+        ("snd_cwnd", "Congestion window (segments)", 1),
+        ("rtt_us", "RTT (ms)", 1000),
+        ("new_retrans", "Retransmissions (segments/interval)", 1),
+    ]
+
+    for ax, (field, xlabel, divisor) in zip(axes, scatter_metrics):
+        for algorithm, result in representative.items():
+            x = [getattr(s, field) / divisor for s in result.samples]
+            y = [s.goodput_bps / 1e6 for s in result.samples]
+
+            ax.scatter(x, y, label=algorithm.upper(),
+                       alpha=0.55, s=12)
+
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Goodput (Mbps)")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    fig.suptitle(f"TCP Metric Relationships - {destination}")
+    fig.tight_layout()
+
+    path = out_dir / "comparison_scatter.pdf"
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"Saved: {path}")
+
+
 # ==============================================================================
 # Entry point
 # ==============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="CS 422 Assignment 2, Parts 1 and 2(a)")
+    parser = argparse.ArgumentParser(description="CS 422 Assignment 3")
     parser.add_argument("--n", type=int, default=N_DESTINATIONS,
                         help="number of destination servers to test (default: 10)")
     parser.add_argument("--duration", type=float, default=DURATION,
                         help="seconds to send data for per destination")
     parser.add_argument("--max-extra-attempts", type=int, default=MAX_REPLACEMENT_ATTEMPTS,
                         help="bounded extra attempts to replace failed destinations")
-    parser.add_argument("--algorithm", choices=["cubic", "reno", "bbr"], default="cubic",
-                        help="TCP congestion-control algorithm: cubic, reno, or bbr")
-    parser.add_argument("--host",
+    parser.add_argument("--algorithm", choices=["cubic", "reno", "bbr", "cs422"], default="cubic",
+                        help="TCP congestion-control algorithm: cubic, reno, cs422, or bbr")
+    parser.add_argument("--host", default="speedtest.lagoon.nc",
                         help="fixed destination host for repeated tests")
-    parser.add_argument("--port", type=int,
+    parser.add_argument("--port", type=int, default="5202",
                         help="fixed destination port for repeated tests")
     parser.add_argument("--repetitions", type=int, default=1,
                         help="number of repetitions for a fixed destination")
+    parser.add_argument("--compare", action="store_true",
+                    help="Run CS422, CUBIC, Reno, and BBR comparisons")
     args = parser.parse_args()
 
     RESULTS_DIR.mkdir(exist_ok=True)
 
     # 1(a) + 1(b): pick destinations and run the iperf3 test on each
-    if args.host:
+    if args.compare:
+        if not args.host or args.port is None:
+            parser.error("--compare requires --host and --port")
+
+        results, log_lines = run_comparison(
+            args.host,
+            args.port,
+            args.duration,
+            args.repetitions
+        )
+
+    elif args.host:
         if args.port is None:
             parser.error("--port is required when --host is provided")
 
@@ -658,6 +912,7 @@ def main():
             args.algorithm,
             args.repetitions
         )
+
     else:
         results, log_lines = select_destinations(
             args.n,
@@ -666,7 +921,7 @@ def main():
             args.algorithm
         )
 
-    output_prefix = args.algorithm
+    output_prefix = "comparison" if args.compare else args.algorithm
     (RESULTS_DIR / f"{output_prefix}_destination_log.txt").write_text(
         "\n".join(log_lines) + "\n"
     )
@@ -687,6 +942,23 @@ def main():
         rows,
         RESULTS_DIR / f"{output_prefix}_summary_table.csv"
     )
+    if args.compare:
+        aggregate_rows = build_aggregate_summary(results)
+        if aggregate_rows:
+            write_summary_csv(
+                aggregate_rows,
+                RESULTS_DIR / "comparison_aggregate_summary.csv"
+            )
+
+            print("\nAggregate comparison:")
+            for row in aggregate_rows:
+                print(
+                    f"{row['algorithm'].upper():<8} "
+                    f"runs={row['successful_runs']} "
+                    f"goodput={row['mean_goodput_Mbps']:.2f} Mbps "
+                    f"RTT={row['mean_RTT_ms']:.2f} ms "
+                    f"retrans={row['mean_retransmissions_per_run']:.1f}"
+                )
     print("\nSummary (Mbps):")
     for row in rows:
         print(f"  {row['destination']:<30} {row['algorithm']:<8} "
@@ -694,13 +966,17 @@ def main():
               f"mean={row['mean_Mbps']:.2f}  p95={row['p95_Mbps']:.2f}")
 
     # 1(c): goodput-versus-time plot
-    plot_goodput(
-        results,
-        RESULTS_DIR / f"{output_prefix}_goodput_plot.png"
-    )
+    if not args.compare:
+        plot_goodput(
+            results,
+            RESULTS_DIR / f"{output_prefix}_goodput_plot.png"
+        )
 
     # 2(b): representative TCP time-series and relationship plots
-    generate_representative_plots(results, RESULTS_DIR)
+    if args.compare:
+        generate_comparison_plots(results, RESULTS_DIR)
+    else:
+        generate_representative_plots(results, RESULTS_DIR)
 
 if __name__ == "__main__":
     main()
