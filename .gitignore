@@ -15,3 +15,8 @@ src/vmlinux.h
 # Miscellaneous
 *.swp
 *~
+*.txt
+*.pdf
+*.csv
+*.png
+__pycache__
